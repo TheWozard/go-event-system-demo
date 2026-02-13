@@ -6,6 +6,12 @@ A demonstration of event-driven architecture patterns in Go, simulating a media 
 
 This project demonstrates various event system patterns through a media catalog system that processes actors, movies, and TV series data.
 
+### Design Priorities
+
+- **Throughput and speed** - Maximizing processing performance is the primary goal.
+- **At-least-once delivery** - Events are guaranteed to be delivered at least once. Handlers should be designed to tolerate duplicate delivery.
+- **Simple autonomous functionality** - Components operate independently with minimal coordination, favouring duplication over complex orchestration.
+
 There are 3 main components in this project.
 1. **Table** - An eventually consistent schema consistent set of data.
 2. **Queue** - An event steam.
