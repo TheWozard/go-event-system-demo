@@ -4,23 +4,25 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/TheWozard/go-event-system-demo/pkg/events"
 )
 
-func NewTable(path string) *Table {
-	return &Table{path: path}
+func NewTable(name, path string) *Table {
+	return &Table{name: name, path: path}
 }
 
 type Table struct {
 	mu      sync.Mutex
+	name    string
 	path    string
-	Handler events.AsyncHandler
+	Handler events.AsyncHandler[any]
 }
 
-func (t *Table) Handle(event events.Event) (events.Result, error) {
+func (t *Table) Handle(event events.Event[any]) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -30,30 +32,32 @@ func (t *Table) Handle(event events.Event) (events.Result, error) {
 
 	_ = json.NewDecoder(file).Decode(&fileData)
 	records := fileData.ToMap()
-	var result events.Result
-	if event.Status == events.StatusDeleted {
-		existing, ok := records[event.ID]
-		if !ok || event.Timestamp.Before(existing.Timestamp) {
-			return events.ResultFilter, nil
+	if event.Context.Status == events.StatusDeleted {
+		existing, ok := records[event.Context.ID]
+		if ok && event.Context.Timestamp.Before(existing.Time()) {
+			return nil
 		}
-		delete(records, event.ID)
-		result = events.ResultDelete
+		records[event.Context.ID] = tableRecord{
+			ID:        event.Context.ID,
+			Timestamp: event.Context.Timestamp.UTC().Format(time.RFC3339Nano),
+			Data:      existing.Data,
+			Deleted:   true,
+		}
 	} else {
 		newRecord := tableRecord{
-			ID:        event.ID,
-			Timestamp: event.Timestamp,
+			ID:        event.Context.ID,
+			Timestamp: event.Context.Timestamp.UTC().Format(time.RFC3339Nano),
 			Data:      event.Data,
 		}
-		if existing, ok := records[event.ID]; ok {
-			if event.Timestamp.Before(existing.Timestamp) {
-				return events.ResultFilter, nil
+		if existing, ok := records[event.Context.ID]; ok {
+			if event.Context.Timestamp.Before(existing.Time()) {
+				return nil
 			}
-			if existing.Hash() == newRecord.Hash() {
-				return events.ResultFilter, nil
+			if !existing.Deleted && existing.Hash() == newRecord.Hash() {
+				return nil
 			}
 		}
-		records[event.ID] = newRecord
-		result = events.ResultUpdate
+		records[event.Context.ID] = newRecord
 	}
 	fileData.FromMap(records)
 
@@ -65,16 +69,68 @@ func (t *Table) Handle(event events.Event) (events.Result, error) {
 
 	if t.Handler != nil {
 		// Create a new event for the change to this table.
-		t.Handler(events.Event{
-			ID:        event.ID,
-			Status:    event.Status,
-			Source:    t.path,
-			Timestamp: time.Now().UTC(),
-			Data:      event.Data,
-		})
+		t.Handler(rawEvent(events.Event[any]{
+			Context: events.Context{
+				ID:        event.Context.ID,
+				Status:    event.Context.Status,
+				Source:    t.name,
+				Timestamp: time.Now().UTC(),
+			},
+			Data: event.Data,
+		}))
 	}
 
-	return result, nil
+	return nil
+}
+
+func (t *Table) Sync(prefix string, timestamp time.Time) error {
+	timestamp = timestamp.Truncate(time.Nanosecond)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var fileData table
+	file, _ := openOrCreate(t.path)
+	defer file.Close()
+
+	_ = json.NewDecoder(file).Decode(&fileData)
+	records := fileData.ToMap()
+
+	var removed []tableRecord
+	for id, record := range records {
+		if strings.HasPrefix(id, prefix) && !record.Deleted && record.Time().Before(timestamp) {
+			record.Deleted = true
+			record.Timestamp = timestamp.UTC().Format(time.RFC3339Nano)
+			records[id] = record
+			removed = append(removed, record)
+		}
+	}
+
+	if len(removed) == 0 {
+		return nil
+	}
+
+	fileData.FromMap(records)
+	_ = file.Truncate(0)
+	_, _ = file.Seek(0, 0)
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	_ = encoder.Encode(&fileData)
+
+	if t.Handler != nil {
+		for _, record := range removed {
+			t.Handler(rawEvent(events.Event[any]{
+				Context: events.Context{
+					ID:        record.ID,
+					Status:    events.StatusDeleted,
+					Source:    t.name,
+					Timestamp: time.Now().UTC(),
+				},
+				Data: record.Data,
+			}))
+		}
+	}
+
+	return nil
 }
 
 type table struct {
@@ -106,9 +162,15 @@ func (t *table) FromMap(m map[string]tableRecord) {
 }
 
 type tableRecord struct {
-	ID        string                 `json:"id"`
-	Timestamp time.Time              `json:"timestamp"`
-	Data      map[string]interface{} `json:"data"`
+	ID        string `json:"id"`
+	Timestamp string `json:"timestamp"`
+	Data      any    `json:"data"`
+	Deleted   bool   `json:"deleted,omitempty"`
+}
+
+func (r tableRecord) Time() time.Time {
+	t, _ := time.Parse(time.RFC3339Nano, r.Timestamp)
+	return t
 }
 
 func (r tableRecord) Hash() [32]byte {

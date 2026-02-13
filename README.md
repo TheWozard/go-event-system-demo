@@ -61,7 +61,19 @@ flowchart LR
 ```
 A single input schema contains a subset of N many objects which are slow to process. These are split off so the fast data can be processed quickly
 
-
+### 4. Fan Out Reconciliation Using Eventual Consistency
+```mermaid
+flowchart LR
+     A[Set of Records 1,3',4']
+     A --> B[Record 1]
+     A --> C[Record 3']
+     A --> D[Record 4']
+     B & C & D --> E[(Record Store 1,2,3)]
+     E --> F[Record 2 Deleted]
+     E --> G[Record 3 Updated]
+     E --> H[Record 4 Added]
+```
+Given an input that contains the complete set, produce both updates and deletes to bring a consumer up to date. This is achieved through eventual consistency timestamp and setting all records before a given point as deleted.
 
 ## Running the Demo
 

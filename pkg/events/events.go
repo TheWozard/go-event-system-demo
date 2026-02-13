@@ -1,33 +1,50 @@
 package events
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 const (
 	StatusActive  Status = "active"
 	StatusDeleted Status = "deleted"
-
-	ResultUpdate Result = "update"
-	ResultDelete Result = "delete"
-	ResultFilter Result = "filter"
-	ResultDrop   Result = "drop"
-	ResultError  Result = "error"
 )
 
-type Event struct {
+type Status string
+
+type Event[T any] struct {
+	Context Context
+	Data    T
+}
+
+type Context struct {
 	ID        string
 	Status    Status
 	Source    string
 	Timestamp time.Time
-	Data      map[string]interface{}
 }
 
-type Result string
-
-type Handler func(Event) (Result, error)
-type AsyncHandler func(Event)
-
-type Status string
-
-type Destination interface {
-	Write(interface{}) (Result, error)
+func (c Context) Split(id string) Context {
+	return Context{
+		ID:        id,
+		Status:    c.Status,
+		Source:    c.Source,
+		Timestamp: c.Timestamp,
+	}
 }
+
+func (c Context) Append(source string) Context {
+	return Context{
+		ID:        c.ID,
+		Status:    c.Status,
+		Source:    c.Source + ":" + source,
+		Timestamp: c.Timestamp,
+	}
+}
+
+func (c Context) Sources() []string {
+	return strings.Split(c.Source, ":")
+}
+
+type Handler[T any] func(Event[T]) error
+type AsyncHandler[T any] func(Event[T])

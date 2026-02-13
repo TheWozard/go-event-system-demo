@@ -13,23 +13,24 @@ import (
 
 	"github.com/TheWozard/go-event-system-demo/pkg/events"
 	"github.com/TheWozard/go-event-system-demo/pkg/file"
+	"github.com/TheWozard/go-event-system-demo/pkg/handler"
 )
 
 func main() {
 	// Tables.
-	rawActor := file.NewTable("./data/raw/actor.json")
-	rawEpisodes := file.NewTable("./data/raw/episodes.json")
-	rawMovie := file.NewTable("./data/raw/movie.json")
-	rawSeries := file.NewTable("./data/raw/series.json")
-	standardPerson := file.NewTable("./data/standard/person.json")
-	standardVideo := file.NewTable("./data/standard/video.json")
-	encodedData := file.NewTable("./data/encoded/data.json")
+	rawActor := file.NewTable("rawActor", "./data/raw/actor.json")
+	rawEpisodes := file.NewTable("rawEpisode", "./data/raw/episodes.json")
+	rawMovie := file.NewTable("rawMovie", "./data/raw/movie.json")
+	rawSeries := file.NewTable("rawSeries", "./data/raw/series.json")
+	standardPerson := file.NewTable("standardPerson", "./data/standard/person.json")
+	standardVideo := file.NewTable("standardVideo", "./data/standard/video.json")
+	encodedData := file.NewTable("encodedData", "./data/encoded/data.json")
 
 	// Queues.
-	rawQueue := file.NewQueue("./data/raw.log")
-	personQueue := file.NewQueue("./data/person.log")
-	videoQueue := file.NewQueue("./data/video.log")
-	encodeQueue := file.NewQueue("./data/encode.log")
+	rawQueue := file.NewQueue("raw_q", "./data/raw.log")
+	personQueue := file.NewQueue("person_q", "./data/person.log")
+	videoQueue := file.NewQueue("video_q", "./data/video.log")
+	encodeQueue := file.NewQueue("encode_q", "./data/encode.log")
 
 	// Wiring tables to produce events to queues.
 	rawActor.Handler = async(rawQueue.Handle)
@@ -39,14 +40,22 @@ func main() {
 	standardPerson.Handler = async(personQueue.Handle)
 	standardVideo.Handler = async(videoQueue.Handle)
 
-	// Wiring queues to process events.
-	rawQueue.Handler = rawProcessor{
-		episodeHandler: rawEpisodes.Handle,
-		personHandler:  standardPerson.Handle,
-		videoHandler:   standardVideo.Handle,
-		encodeHandler:  encodeQueue.Handle,
-	}.Handle
-	encodeQueue.Handler = delay(1*time.Second, encodeData(encodedData.Handle))
+	rawDest := rawDestination{TypeBasedRouter: handler.TypeBasedRouter{}}
+	handler.RegisterType[Person](rawDest.TypeBasedRouter, standardPerson.Handle)
+	handler.RegisterType[Video](rawDest.TypeBasedRouter, standardVideo.Handle)
+	handler.RegisterType[Encode](rawDest.TypeBasedRouter, encodeQueue.Handle)
+	handler.RegisterType[RawEpisode](rawDest.TypeBasedRouter, rawEpisodes.Handle)
+	rawDest.EpisodesTable = rawEpisodes
+	rawQueue.Handler = async(handler.SourceRouter[any]{
+		"rawActor":   handler.TypedDataHandler(rawDest.actor),
+		"rawEpisode": handler.TypedDataHandler(rawDest.episodes),
+		"rawMovie":   handler.TypedDataHandler(rawDest.movie),
+		"rawSeries":  handler.TypedDataHandler(rawDest.splitSeries),
+	}.Handler)
+
+	encodeDest := encodeDestination{TypeBasedRouter: handler.TypeBasedRouter{}}
+	handler.RegisterType[EncodeResult](encodeDest.TypeBasedRouter, encodedData.Handle)
+	encodeQueue.Handler = async(delay(1*time.Second, handler.TypedDataHandler(encodeDest.Encode)))
 
 	// Endpoints enable sending messages into the system.
 	mux := http.NewServeMux()
@@ -63,129 +72,159 @@ func main() {
 
 // -- Handlers --
 
-type rawProcessor struct {
-	episodeHandler events.Handler
-	personHandler  events.Handler
-	videoHandler   events.Handler
-
-	encodeHandler events.Handler
+type rawDestination struct {
+	handler.TypeBasedRouter
+	EpisodesTable *file.Table
 }
 
-func (r rawProcessor) Handle(e events.Event) (events.Result, error) {
-	if strings.Contains(e.Source, "actor") {
-		return r.actor(e)
-	} else if strings.Contains(e.Source, "episode") {
-		return r.episodes(e)
-	} else if strings.Contains(e.Source, "movie") {
-		return r.movie(e)
-	} else if strings.Contains(e.Source, "series") {
-		return r.splitSeries(e)
-	}
-	return events.ResultDrop, nil
+type Person struct {
+	Name string `json:"name"`
 }
 
-func (r rawProcessor) actor(e events.Event) (events.Result, error) {
-	return r.personHandler(e)
+type Encode struct {
+	Title    string `json:"title"`
+	Location string `json:"location"`
 }
 
-func (r rawProcessor) episodes(e events.Event) (events.Result, error) {
-	combined := fmt.Sprintf("%s_ep_%d", e.Data["seriesTitle"].(string), e.Data["episodeNumber"].(int))
-	r.encode(combined, e)
-	return r.movie(e)
+type Video struct {
+	Title string `json:"title"`
 }
 
-func (r rawProcessor) movie(e events.Event) (events.Result, error) {
-	r.encode(e.Data["title"].(string), e)
-	return r.videoHandler(e)
-}
+type RawEpisode map[string]any
 
-func (r rawProcessor) encode(file string, e events.Event) {
-	file = strings.ReplaceAll(strings.ToLower(file), " ", "_")
-	async(r.encodeHandler)(events.Event{
-		ID:        e.ID,
-		Status:    e.Status,
-		Source:    "video",
-		Timestamp: time.Now().UTC(),
-		Data: map[string]interface{}{
-			"location": fmt.Sprintf("file://%s.mkv", file),
+func (d rawDestination) actor(event events.Event[struct {
+	Name string `json:"name"`
+}]) error {
+	return d.Handler(events.Event[any]{
+		Context: event.Context,
+		Data: Person{
+			Name: event.Data.Name,
 		},
 	})
 }
 
-func (r rawProcessor) splitSeries(e events.Event) (events.Result, error) {
-	episodes, ok := e.Data["episodes"].([]interface{})
-	if !ok {
-		return events.ResultError, fmt.Errorf("invalid episodes data")
-	}
-	for i, ep := range episodes {
-		epData, ok := ep.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		epData["seriesID"] = e.ID
-		epData["seriesTitle"] = e.Data["title"]
-		epData["episodeNumber"] = i + 1
-		async(r.episodeHandler)(events.Event{
-			ID:        fmt.Sprintf("%s_ep%d", e.ID, i+1),
-			Status:    e.Status,
-			Source:    "splitSeries",
-			Timestamp: time.Now().UTC(),
-			Data:      epData,
-		})
-	}
-	return events.ResultUpdate, nil
+func (d rawDestination) episodes(event events.Event[struct {
+	SeriesTitle   string `json:"seriesTitle"`
+	EpisodeNumber int    `json:"episodeNumber"`
+}]) error {
+	title := fmt.Sprintf("%s %d", event.Data.SeriesTitle, event.Data.EpisodeNumber)
+	return d.encode(event.Context, Video{
+		Title: title,
+	})
 }
 
-func encodeData(store events.Handler) events.Handler {
-	return func(e events.Event) (events.Result, error) {
-		hash := sha256.Sum256([]byte(e.Data["location"].(string)))
-		e.Data["encodedHash"] = fmt.Sprintf("%x", hash)
-		e.Data["location"] = strings.ReplaceAll(e.Data["location"].(string), ".mkv", "_encoded.mkv")
-		return store(e)
+func (d rawDestination) movie(event events.Event[struct {
+	Title string `json:"title"`
+}]) error {
+	return d.encode(event.Context, Video{
+		Title: event.Data.Title,
+	})
+}
+
+func (d rawDestination) encode(context events.Context, video Video) error {
+	file := strings.ReplaceAll(strings.ToLower(video.Title), " ", "_")
+	return d.HandleAll([]events.Event[any]{
+		{
+			Context: context,
+			Data:    video,
+		},
+		{
+			Context: context,
+			Data: Encode{
+				Title:    video.Title,
+				Location: fmt.Sprintf("file://%s.mkv", file),
+			},
+		},
+	})
+}
+
+func (d rawDestination) splitSeries(event events.Event[struct {
+	Title    string `json:"title"`
+	Episodes []struct {
+		Title string `json:"title"`
+	} `json:"episodes"`
+}]) error {
+	for i, ep := range event.Data.Episodes {
+		if err := d.Handler(events.Event[any]{
+			Context: event.Context.Split(fmt.Sprintf("%s_ep%d", event.Context.ID, i+1)),
+			Data: RawEpisode{
+				"seriesTitle":  event.Data.Title,
+				"episodeTitle": ep.Title,
+				"seriesNumber": i + 1,
+			},
+		}); err != nil {
+			return err
+		}
 	}
+	return d.EpisodesTable.Sync(event.Context.ID, event.Context.Timestamp)
+}
+
+type EncodeResult struct {
+	Title    string `json:"title"`
+	Hash     string `json:"hash"`
+	Location string `json:"location"`
+}
+
+type encodeDestination struct {
+	handler.TypeBasedRouter
+}
+
+func (d encodeDestination) Encode(e events.Event[Encode]) error {
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(e.Data.Location)))
+	location := strings.ReplaceAll(e.Data.Location, ".mkv", "_encoded.mkv")
+	return d.Handler(events.Event[any]{
+		Context: e.Context,
+		Data: EncodeResult{
+			Title:    e.Data.Title,
+			Hash:     hash,
+			Location: location,
+		},
+	})
 }
 
 // -- Utility Functions --
 
-func async(h events.Handler) events.AsyncHandler {
-	return func(e events.Event) {
+func async[T any](wrapped events.Handler[T]) events.AsyncHandler[T] {
+	return func(e events.Event[T]) {
 		go func() {
-			result, err := h(e)
-			writeEvent(os.Stderr, e, result, err)
+			err := wrapped(e)
+			writeEvent(os.Stderr, e, err)
 		}()
 	}
 }
 
-func delay(d time.Duration, h events.Handler) events.Handler {
-	return func(e events.Event) (events.Result, error) {
+func delay[T any](d time.Duration, h events.Handler[T]) events.Handler[T] {
+	return func(e events.Event[T]) error {
 		time.Sleep(d)
 		return h(e)
 	}
 }
 
-func attachHandler(mux *http.ServeMux, path string, handler events.Handler) {
+func attachHandler[T any](mux *http.ServeMux, path string, handler events.Handler[T]) {
 	mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
 		status := r.URL.Query().Get("status")
-		data := map[string]interface{}{}
+		var data T
 		_ = json.NewDecoder(r.Body).Decode(&data)
-		event := events.Event{
-			ID:        id,
-			Status:    events.Status(status),
-			Source:    path,
-			Timestamp: time.Now().UTC(),
-			Data:      data,
+		event := events.Event[T]{
+			Context: events.Context{
+				ID:        id,
+				Status:    events.Status(status),
+				Source:    path,
+				Timestamp: time.Now().UTC(),
+			},
+			Data: data,
 		}
-		result, err := handler(event)
-		writeEvent(w, event, result, err)
+		err := handler(event)
+		writeEvent(w, event, err)
 	})
 }
 
-func writeEvent(w io.Writer, event events.Event, result events.Result, err error) {
-	timestamp := event.Timestamp.Format("03:04:05.000")
+func writeEvent[T any](w io.Writer, event events.Event[T], err error) {
+	timestamp := event.Context.Timestamp.Format("03:04:05.000")
 	if err != nil {
-		fmt.Fprintf(w, "%s %-30s | %-15s | %s: %s\n", timestamp, event.Source, event.ID, result, err.Error())
+		fmt.Fprintf(w, "%s %-25s | %-15s %s\n", timestamp, event.Context.Source, event.Context.ID, err.Error())
 	} else {
-		fmt.Fprintf(w, "%s %-30s | %-15s | %s\n", timestamp, event.Source, event.ID, result)
+		fmt.Fprintf(w, "%s %-25s | %-15s \n", timestamp, event.Context.Source, event.Context.ID)
 	}
 }
